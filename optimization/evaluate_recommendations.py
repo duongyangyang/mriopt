@@ -72,16 +72,8 @@ def main():
     parser.add_argument("--out_dir", default="optimization/evaluation")
     parser.add_argument("--top_k", type=int, default=2, help="Số ứng viên đa-dạng/top-K đề xuất")
     parser.add_argument("--min_dist_frac", type=float, default=0.3,
-                         help="Khoảng cách chuẩn hóa tối thiểu giữa các ứng viên top-K (cho selection=greedy)")
-    parser.add_argument("--selection", default="te_stratified", choices=["greedy", "te_stratified"],
-                         help="greedy: tách theo (TR,TE); te_stratified: ép mỗi bin TE có 1 ứng viên (bắt chế độ T2)")
-    parser.add_argument("--te_split", default=None,
-                         help="Ngưỡng TE chia bin (vd '15,60'). Mặc định: tự chọn theo top_k.")
+                         help="Khoảng cách chuẩn hóa tối thiểu giữa các ứng viên top-K")
     args = parser.parse_args()
-
-    te_split = None
-    if args.te_split:
-        te_split = [float(x) for x in args.te_split.split(",")]
 
     os.makedirs(args.out_dir, exist_ok=True)
     test_phantoms = [int(x) for x in args.test_phantoms.split(",")]
@@ -111,8 +103,7 @@ def main():
         image_tensor = load_image(tmp_img_path)
 
         pred = recommend(model, image_tensor, args.device, args.tr0, args.te0, j0_true, j_mean, j_std,
-                         top_k=args.top_k, min_dist_frac=args.min_dist_frac,
-                         selection=args.selection, te_split=te_split)
+                         top_k=args.top_k, min_dist_frac=args.min_dist_frac)
         cands = pred["candidates"]
 
         # J thật + J_lost cho từng ứng viên; chọn best-of-K (oracle) theo J thật
@@ -135,7 +126,6 @@ def main():
             "TR_pred_best": best["TR"], "TE_pred_best": best["TE"],
             "J_lost_best_of_k": best["pct_J_lost"],
             "n_candidates": len(cand_rows),
-            "selection_mode": args.selection,
             "J0_anchor": j0_true,
             "candidates": json.dumps(cand_rows),
         })
@@ -150,7 +140,7 @@ def main():
     result_df = pd.DataFrame(records)
     result_df.to_csv(os.path.join(args.out_dir, "recommendation_evaluation.csv"), index=False)
 
-    print(f"\n=== Summary over held-out phantoms (selection={args.selection}, top_k={args.top_k}) ===")
+    print("\n=== Summary over held-out phantoms (anchor-based model) ===")
     print(f"TR* abs error top1 (ms): mean={abs(result_df['TR_true']-result_df['TR_pred_top1']).mean():.1f}, "
           f"median={abs(result_df['TR_true']-result_df['TR_pred_top1']).median():.1f}")
     print(f"%% J lost @top1:        mean={result_df['J_lost_top1'].mean():.1f}%%, "
