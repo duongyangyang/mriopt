@@ -1,0 +1,14 @@
+numpy
+scipy
+pandas
+matplotlib
+opencv-python-headless
+scikit-learn
+pytest
+pillow
+tqdm
+torch
+torchvision
+# Added in later phases:
+# streamlit
+# scikit-optimize (Bayesian optimization)

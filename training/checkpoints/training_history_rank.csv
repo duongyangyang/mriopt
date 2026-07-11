@@ -1,0 +1,2 @@
+epoch,train_loss,train_mse,train_rank,val_loss,val_spearman,lr,epoch_time_sec
+1,0.8379522840181987,0.7358310918013254,0.10212119668722153,,,0.0001,134.4166281223297
