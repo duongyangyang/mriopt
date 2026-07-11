@@ -45,6 +45,17 @@ def lookup_true_j(true_df: pd.DataFrame, tr: float, te: float) -> float:
     return float(sub.loc[sub["dist"].idxmin(), "J"])
 
 
+def parse_anchors(args):
+    """Trả list (tr0, te0). Nếu có --anchors thì parse 'tr,te'; không thì dùng --tr0/--te0."""
+    if args.anchors:
+        out = []
+        for a in args.anchors:
+            tr, te = a.split(",")
+            out.append((float(tr), float(te)))
+        return out
+    return [(args.tr0, args.te0)]
+
+
 def compute_true_grid(phantom_idx: int) -> pd.DataFrame:
     """Tính J thật cho toàn bộ lưới TR/TE của 1 phantom, dùng simulator thật (ground truth)."""
     label_map = np.load(os.path.join(PHANTOM_ROOT, f"phantom_{phantom_idx:04d}", "label_map.npy"))
@@ -70,9 +81,11 @@ def main():
     parser.add_argument("--te0", type=float, default=10.0, help="TE của ảnh anchor 'đã chụp'")
     parser.add_argument("--device", default=_default_device())
     parser.add_argument("--out_dir", default="optimization/evaluation")
-    parser.add_argument("--top_k", type=int, default=2, help="Số ứng viên đa-dạng/top-K đề xuất")
+    parser.add_argument("--top_k", type=int, default=2, help="Số ứng viên đa-dạng/top-K đề xuất MỖI anchor")
     parser.add_argument("--min_dist_frac", type=float, default=0.3,
                          help="Khoảng cách chuẩn hóa tối thiểu giữa các ứng viên top-K")
+    parser.add_argument("--anchors", nargs="+", default=None,
+                         help='Danh sách anchor "tr,te" (vd: 200,10 3000,80). Bỏ trống -> dùng --tr0/--te0.')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -83,38 +96,53 @@ def main():
         raise ValueError("Checkpoint không chứa j_mean/j_std -- cần train lại bằng training/train.py mới")
 
     records = []
+    anchors = parse_anchors(args)
+    anchors_str = ";".join(f"{int(t)},{int(e)}" for t, e in anchors)
+    print(f"Anchors: {anchors_str} | top_k/anchor={args.top_k}")
+    from PIL import Image
+
     for p_idx in test_phantoms:
         true_df, label_map, tissue_params = compute_true_grid(p_idx)
         true_best = true_df.loc[true_df["J"].idxmax()]
         j_true_max = float(true_best["J"])
 
-        # tính J0 thật tại điểm anchor (TR0, TE0) -- giả định biết được (đã segment ảnh anchor)
-        seed0 = p_idx * 100000 + int(args.tr0) * 100 + int(args.te0)
-        image0 = simulate_mri(label_map, args.tr0, args.te0, gaussian_noise_std=GAUSSIAN_NOISE_STD,
-                               seed=seed0, tissue_params=tissue_params)
-        noise_std0 = estimate_noise_std(image0, label_map)
-        j0_true = cnr_wm_gm(image0, label_map, noise_std=noise_std0) - LAMBDA * scan_time(args.tr0)
+        # chạy recommend() cho từng anchor, gộp candidates
+        all_cands = []
+        for (tr0, te0) in anchors:
+            seed0 = p_idx * 100000 + int(tr0) * 100 + int(te0)
+            image0 = simulate_mri(label_map, tr0, te0, gaussian_noise_std=GAUSSIAN_NOISE_STD,
+                                   seed=seed0, tissue_params=tissue_params)
+            noise_std0 = estimate_noise_std(image0, label_map)
+            j0_true = cnr_wm_gm(image0, label_map, noise_std=noise_std0) - LAMBDA * scan_time(tr0)
 
-        # lưu ảnh anchor tạm để load lại qua load_image (giữ nhất quán pipeline)
-        from PIL import Image
-        tmp_img_path = os.path.join(args.out_dir, f"_tmp_anchor_p{p_idx}.png")
-        img_norm = np.clip(image0 / (image0.max() + 1e-8) * 255, 0, 255).astype(np.uint8)
-        Image.fromarray(img_norm).save(tmp_img_path)
-        image_tensor = load_image(tmp_img_path)
+            tmp_img_path = os.path.join(args.out_dir, f"_tmp_anchor_p{p_idx}_tr{int(tr0)}_te{int(te0)}.png")
+            img_norm = np.clip(image0 / (image0.max() + 1e-8) * 255, 0, 255).astype(np.uint8)
+            Image.fromarray(img_norm).save(tmp_img_path)
+            image_tensor = load_image(tmp_img_path)
 
-        pred = recommend(model, image_tensor, args.device, args.tr0, args.te0, j0_true, j_mean, j_std,
-                         top_k=args.top_k, min_dist_frac=args.min_dist_frac)
-        cands = pred["candidates"]
+            pred = recommend(model, image_tensor, args.device, tr0, te0, j0_true, j_mean, j_std,
+                             top_k=args.top_k, min_dist_frac=args.min_dist_frac)
+            for c in pred["candidates"]:
+                all_cands.append({**c, "anchor": f"{int(tr0)},{int(te0)}", "j0": j0_true})
+            os.remove(tmp_img_path)
 
-        # J thật + J_lost cho từng ứng viên; chọn best-of-K (oracle) theo J thật
+        # gộp + tra cứu J thật; dedup theo (TR,TE) giữ J_pred cao hơn
         cand_rows = []
-        for c in cands:
+        seen = {}
+        for c in all_cands:
+            key = (round(c["TR"]), round(c["TE"]))
             j_true_c = lookup_true_j(true_df, c["TR"], c["TE"])
             j_lost_c = 100.0 * (j_true_max - j_true_c) / (abs(j_true_max) + 1e-8)
-            cand_rows.append({
-                "TR": c["TR"], "TE": c["TE"], "J_pred": c["J_pred"],
-                "J_true": j_true_c, "pct_J_lost": j_lost_c,
-            })
+            row = {"TR": c["TR"], "TE": c["TE"], "J_pred": c["J_pred"],
+                   "J_true": j_true_c, "pct_J_lost": j_lost_c, "anchor": c["anchor"]}
+            if key in seen:
+                if row["J_pred"] > cand_rows[seen[key]]["J_pred"]:
+                    cand_rows[seen[key]] = row
+            else:
+                seen[key] = len(cand_rows)
+                cand_rows.append(row)
+        # top1 = ứng viên có J_pred cao nhất (lựa đơn của model trên union); best = oracle theo J thật
+        cand_rows.sort(key=lambda r: r["J_pred"], reverse=True)
         top1 = cand_rows[0]
         best = max(cand_rows, key=lambda r: r["J_true"])
 
@@ -125,17 +153,18 @@ def main():
             "J_lost_top1": top1["pct_J_lost"],
             "TR_pred_best": best["TR"], "TE_pred_best": best["TE"],
             "J_lost_best_of_k": best["pct_J_lost"],
+            "anchor_best": best["anchor"],
             "n_candidates": len(cand_rows),
-            "J0_anchor": j0_true,
+            "n_anchors": len(anchors),
+            "anchors_used": anchors_str,
             "candidates": json.dumps(cand_rows),
         })
-        cand_str = " | ".join(f"({c['TR']:.0f},{c['TE']:.0f})Jl={c['pct_J_lost']:.1f}%" for c in cand_rows)
+        cand_str = " | ".join(f"({c['TR']:.0f},{c['TE']:.0f})Jl={c['pct_J_lost']:.1f}%<{c['anchor']}"
+                             for c in cand_rows)
         print(f"phantom {p_idx}: true=({true_best['TR']:.0f},{true_best['TE']:.0f}) "
               f"top1=({top1['TR']:.0f},{top1['TE']:.0f}) Jl@top1={top1['pct_J_lost']:.1f}% "
               f"best=({best['TR']:.0f},{best['TE']:.0f}) Jl@bestK={best['pct_J_lost']:.1f}% "
-              f"[{cand_str}]")
-
-        os.remove(tmp_img_path)
+              f"anchor_best={best['anchor']} [{cand_str}]")
 
     result_df = pd.DataFrame(records)
     result_df.to_csv(os.path.join(args.out_dir, "recommendation_evaluation.csv"), index=False)
