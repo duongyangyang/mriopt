@@ -86,6 +86,12 @@ def main():
                          help="Khoảng cách chuẩn hóa tối thiểu giữa các ứng viên top-K")
     parser.add_argument("--anchors", nargs="+", default=None,
                          help='Danh sách anchor "tr,te" (vd: 200,10 3000,80). Bỏ trống -> dùng --tr0/--te0.')
+    parser.add_argument("--tr_min", type=float, default=200.0)
+    parser.add_argument("--tr_max", type=float, default=4001.0, help="Upper bound exclusive (4001 -> gồm 4000)")
+    parser.add_argument("--te_min", type=float, default=10.0)
+    parser.add_argument("--te_max", type=float, default=201.0, help="Upper bound exclusive (201 -> gồm 200)")
+    parser.add_argument("--tr_step", type=float, default=50.0)
+    parser.add_argument("--te_step", type=float, default=5.0)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -98,7 +104,11 @@ def main():
     records = []
     anchors = parse_anchors(args)
     anchors_str = ";".join(f"{int(t)},{int(e)}" for t, e in anchors)
+    tr_cand = np.arange(args.tr_min, args.tr_max, args.tr_step)
+    te_cand = np.arange(args.te_min, args.te_max, args.te_step)
     print(f"Anchors: {anchors_str} | top_k/anchor={args.top_k}")
+    print(f"Candidate grid: TR [{tr_cand.min()},{tr_cand.max()}] step {args.tr_step} ({len(tr_cand)} pts) | "
+          f"TE [{te_cand.min()},{te_cand.max()}] step {args.te_step} ({len(te_cand)} pts)")
     from PIL import Image
 
     for p_idx in test_phantoms:
@@ -121,6 +131,7 @@ def main():
             image_tensor = load_image(tmp_img_path)
 
             pred = recommend(model, image_tensor, args.device, tr0, te0, j0_true, j_mean, j_std,
+                             tr_candidates=tr_cand, te_candidates=te_cand,
                              top_k=args.top_k, min_dist_frac=args.min_dist_frac)
             for c in pred["candidates"]:
                 all_cands.append({**c, "anchor": f"{int(tr0)},{int(te0)}", "j0": j0_true})
