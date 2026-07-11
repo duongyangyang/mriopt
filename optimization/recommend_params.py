@@ -58,14 +58,18 @@ def load_image(image_path: str) -> torch.Tensor:
 def recommend(model, image_tensor: torch.Tensor, device: str,
               tr0: float, te0: float, j0: float, j_mean: float, j_std: float,
               tr_candidates=TR_CANDIDATES, te_candidates=TE_CANDIDATES,
-              batch_size: int = 512, top_k: int = 1, min_dist_frac: float = 0.3):
+              batch_size: int = 512, top_k: int = 1, min_dist_frac: float = 0.3,
+              selection: str = "greedy", te_split=None):
     """
     Quét toàn bộ lưới candidate (TRc, TEc), giữ cố định (image, TR0, TE0, J0),
     dự đoán Jc cho từng candidate. Trả về:
       - (TR*, TE*) = argmax Jc_pred (top-1, backward-compat).
-      - `candidates`: list top-K ứng viên ĐA DẠNG theo chế độ (greedy: mỗi ứng
-        viên tiếp theo phải cách các ứng viên đã chọn > min_dist_frac trên trục
-        (TR,TE) chuẩn hóa) -> bắt được nhiều cực trị (vd. chế độ T1 sớm & T2 muộn).
+      - `candidates`: list top-K ứng viên theo `selection`:
+          * "greedy": chọn J cao nhất, rồi các điểm xa (TR,TE) chuẩn hóa > min_dist_frac
+            -- đa dạng nhưng nếu model collapse TE thì chỉ tách theo TR.
+          * "te_stratified": chia candidate theo K bin TE (cạnh giới bởi TE_MIN,
+            te_split, TE_MAX) lấy argmax mỗi bin -- ÉP có ứng viên TE dài để bắt
+            chế độ T2 (true optimum TE>10).
     """
     TR_grid, TE_grid = np.meshgrid(tr_candidates.astype(float), te_candidates.astype(float))
     trc_flat, tec_flat = TR_grid.ravel(), TE_grid.ravel()
@@ -96,11 +100,15 @@ def recommend(model, image_tensor: torch.Tensor, device: str,
     idx_te, idx_tr = np.unravel_index(np.argmax(J_grid), J_grid.shape)
     tr_star, te_star, j_max = tr_candidates[idx_tr], te_candidates[idx_te], J_grid[idx_te, idx_tr]
 
-    candidates = _diverse_topk(
-        trc_flat, tec_flat, preds,
-        tr_range=(TR_MAX - TR_MIN), te_range=(TE_MAX - TE_MIN),
-        top_k=top_k, min_dist_frac=min_dist_frac,
-    )
+    if selection == "te_stratified":
+        edges = _te_edges(top_k, te_split)
+        candidates = _te_stratified_topk(trc_flat, tec_flat, preds, edges)
+    else:
+        candidates = _diverse_topk(
+            trc_flat, tec_flat, preds,
+            tr_range=(TR_MAX - TR_MIN), te_range=(TE_MAX - TE_MIN),
+            top_k=top_k, min_dist_frac=min_dist_frac,
+        )
 
     return {
         "TR_grid": TR_grid, "TE_grid": TE_grid, "J_grid": J_grid,
@@ -127,6 +135,40 @@ def _diverse_topk(tr_flat, te_flat, j_pred, tr_range, te_range, top_k, min_dist_
             if len(picked) >= top_k:
                 break
     return [{"TR": t[0], "TE": t[1], "J_pred": t[2]} for t in picked]
+
+
+def _te_edges(top_k, te_split):
+    """Cạnh các bin TE. te_split = ngưỡng nội bộ (vd [15] -> bin [10,15],(15,200]).
+    Nếu None, tự chọn theo top_k: k=2->[15], k=3->[15,60] (isolate TE≤15 khỏi T2)."""
+    if te_split is None:
+        if top_k == 2:
+            te_split = [15.0]
+        elif top_k == 3:
+            te_split = [15.0, 60.0]
+        else:
+            qs = np.linspace(0, 1, top_k + 1)[1:-1]
+            te_split = list(qs * (TE_MAX - TE_MIN) + TE_MIN)
+    edges = [TE_MIN] + list(te_split) + [TE_MAX]
+    return sorted(set(edges))
+
+
+def _te_stratified_topk(tr_flat, te_flat, j_pred, te_edges):
+    """Lấy argmax J_pred trong mỗi bin TE (bin cuối đóng cả 2 đầu). Đảm bảo có
+    ứng viên TE dài để bắt chế độ T2 dù model bias về TE ngắn."""
+    cands = []
+    n_bins = len(te_edges) - 1
+    for i in range(n_bins):
+        lo, hi = te_edges[i], te_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (te_flat >= lo) & (te_flat <= hi)
+        else:
+            mask = (te_flat >= lo) & (te_flat < hi)
+        if not mask.any():
+            continue
+        idxs = np.where(mask)[0]
+        best = idxs[np.argmax(j_pred[idxs])]
+        cands.append((float(tr_flat[best]), float(te_flat[best]), float(j_pred[best])))
+    return [{"TR": c[0], "TE": c[1], "J_pred": c[2]} for c in cands]
 
 
 def plot_recommendation(result, tr0, te0, out_path):
