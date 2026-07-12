@@ -13,6 +13,10 @@ Khác với train.py (chỉ MSE):
 
 Chạy Mac (Apple Silicon):
     PYTHONPATH=. python3 training/train_rank.py --epochs 30 --device mps
+
+Các tùy chọn mới:
+    --mse_weight: trọng số nhân cho term masked MSE trong loss tổng
+    --save_metric: chọn checkpoint tốt nhất theo 'mse' hoặc 'rank'
 """
 import os
 import sys
@@ -138,8 +142,12 @@ def main():
     parser.add_argument("--list_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--mse_weight", type=float, default=1.0,
+                        help="Trọng số nhân cho masked MSE trong loss tổng: loss = mse_weight * mse + lambda_rank * rank")
     parser.add_argument("--lambda_rank", type=float, default=1.0)
     parser.add_argument("--margin", type=float, default=0.1, help="Margin hinge (đơn vị J chuẩn hóa)")
+    parser.add_argument("--save_metric", choices=["mse", "rank"], default="mse",
+                        help="Chọn checkpoint tốt nhất theo validation MSE hoặc validation Spearman rank")
     parser.add_argument("--device", default=get_default_device())
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--out_dir", default="training/checkpoints")
@@ -178,7 +186,10 @@ def main():
 
     history = {"epoch": [], "train_loss": [], "train_mse": [], "train_rank": [],
                "val_loss": [], "val_spearman": [], "lr": [], "epoch_time_sec": []}
-    best_val_loss = float("inf")
+    if args.save_metric == "mse":
+        best_score = float("inf")
+    else:
+        best_score = -float("inf")
     import time as _time
 
     for epoch in range(1, args.epochs + 1):
@@ -199,7 +210,7 @@ def main():
 
             mse = masked_mse(pred, target, mask)
             rank = pairwise_hinge(pred, target, mask, margin_t)
-            loss = mse + args.lambda_rank * rank
+            loss = args.mse_weight * mse + args.lambda_rank * rank
             loss.backward()
             optimizer.step()
 
@@ -232,8 +243,15 @@ def main():
         print(f"Epoch {epoch}/{args.epochs} - loss={train_loss:.4f} mse={train_mse:.4f} rank={train_rank:.4f} "
               f"| val_mse={val_loss:.4f} val_spearman={val_sp:.4f} lr={current_lr:.2e} time={epoch_time:.1f}s")
 
-        if not (val_loss != val_loss) and val_loss < best_val_loss:  # skip NaN val
-            best_val_loss = val_loss
+        if args.save_metric == "mse":
+            improved = np.isfinite(val_loss) and val_loss < best_score
+            current_metric = val_loss
+        else:
+            improved = np.isfinite(val_sp) and val_sp > best_score
+            current_metric = val_sp
+
+        if improved:
+            best_score = current_metric
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "epoch": epoch,
@@ -242,14 +260,19 @@ def main():
                 "train_loss": train_loss,
                 "j_mean": j_mean,
                 "j_std": j_std,
+                "mse_weight": args.mse_weight,
                 "lambda_rank": args.lambda_rank,
                 "margin": args.margin,
+                "save_metric": args.save_metric,
                 "train_phantoms": sorted(train_p),
                 "val_phantoms": sorted(val_p),
                 "test_phantoms": sorted(test_p),
                 "args": vars(args),
             }, os.path.join(args.out_dir, args.ckpt_name))
-            print(f"  -> saved new best model (val_mse={val_loss:.4f}, val_spearman={val_sp:.4f})")
+            if args.save_metric == "mse":
+                print(f"  -> saved new best model (val_mse={current_metric:.4f}, val_spearman={val_sp:.4f})")
+            else:
+                print(f"  -> saved new best model (val_spearman={current_metric:.4f}, val_mse={val_loss:.4f})")
 
     # ---- Final test eval (single-sample, tái dùng evaluate() từ train.py) ----
     ckpt_path = os.path.join(args.out_dir, args.ckpt_name)
